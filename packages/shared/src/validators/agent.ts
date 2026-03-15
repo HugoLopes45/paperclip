@@ -53,7 +53,18 @@ export const createAgentSchema = z.object({
   desiredSkills: z.array(z.string().min(1)).optional(),
   adapterType: z.enum(AGENT_ADAPTER_TYPES).optional().default("process"),
   adapterConfig: adapterConfigSchema.optional().default({}),
-  runtimeConfig: z.record(z.unknown()).optional().default({}),
+  runtimeConfig: z.record(z.unknown()).superRefine((value, ctx) => {
+    const strategy = value.workspaceStrategy;
+    if (strategy === undefined) return;
+    const valid = ["git_worktree", "project_primary"];
+    if (!valid.includes(strategy as string)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `runtimeConfig.workspaceStrategy must be "git_worktree" or "project_primary"`,
+        path: ["workspaceStrategy"],
+      });
+    }
+  }).optional().default({}),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.unknown()).optional().nullable(),
@@ -76,6 +87,7 @@ export const updateAgentSchema = createAgentSchema
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
+    projectId: z.string().uuid().optional().nullable(),
   });
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;
