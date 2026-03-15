@@ -226,7 +226,7 @@ interface ParsedIssueAssigneeAdapterOverrides {
 
 export type ResolvedWorkspaceForRun = {
   cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
+  source: "project_primary" | "task_session" | "agent_config" | "agent_home";
   projectId: string | null;
   workspaceId: string | null;
   repoUrl: string | null;
@@ -1116,6 +1116,28 @@ export function heartbeatService(db: Db) {
           workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
           repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+          workspaceHints,
+          warnings: [],
+        };
+      }
+    }
+
+    // Fix #952: use agent's own adapterConfig.cwd (valid git repo) before falling back to
+    // the empty default workspace dir, which is not a git repo and crashes worktree agents.
+    const agentConfigCwd = readNonEmptyString(parseObject(agent.adapterConfig).cwd);
+    if (agentConfigCwd) {
+      const agentConfigCwdExists = await fs
+        .stat(agentConfigCwd)
+        .then((s) => s.isDirectory())
+        .catch(() => false);
+      if (agentConfigCwdExists) {
+        return {
+          cwd: agentConfigCwd,
+          source: "agent_config" as const,
+          projectId: resolvedProjectId,
+          workspaceId: null,
+          repoUrl: null,
+          repoRef: null,
           workspaceHints,
           warnings: [],
         };
