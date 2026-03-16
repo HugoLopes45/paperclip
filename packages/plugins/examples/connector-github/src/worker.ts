@@ -9,8 +9,15 @@ import {
 import type { Issue } from "@paperclipai/shared";
 import { GH_CLOSED_STATUSES, GH_EVENTS, WEBHOOK_KEYS } from "./constants.js";
 import { verifyGitHubSignature } from "./verify.js";
-import { isDuplicateDelivery, markOutboundEcho } from "./echo.js";
-import { getIssueMapping, setIssueMapping, getPrMapping, setPrMapping } from "./mapping.js";
+import { isDuplicateDelivery } from "./echo.js";
+import {
+  getIssueMapping,
+  setIssueMapping,
+  getPrMapping,
+  setPrMapping,
+  markOutboundIssueEcho,
+  consumeOutboundIssueEcho,
+} from "./mapping.js";
 import { createGitHubIssue, updateGitHubIssue, createGitHubComment } from "./github-api.js";
 
 type GitHubConfig = {
@@ -65,6 +72,14 @@ async function handleIssuesEvent(
   if (!companyId) return;
 
   if (action === "opened") {
+    // Suppress issues:opened webhooks that we ourselves triggered by pushing to GitHub.
+    // The outbound handler writes a marker keyed by owner/repo/ghNumber after a
+    // successful createGitHubIssue call; we consume it here (single-use).
+    if (await consumeOutboundIssueEcho(ctx, owner, repo, ghNumber)) {
+      // Still store the mapping — the reverse lookup already wrote it outbound,
+      // but calling setIssueMapping here is idempotent and keeps both paths consistent.
+      return;
+    }
     const issue = await ctx.issues.create({
       companyId,
       projectId: config.defaultProjectId,
@@ -173,7 +188,10 @@ async function handlePullRequestReviewEvent(
   ctx: PluginContext,
   config: GitHubConfig,
   payload: Record<string, unknown>,
+  deliveryId: string,
 ): Promise<void> {
+  if (await isDuplicateDelivery(ctx, deliveryId)) return;
+
   const repository = payload.repository as Record<string, unknown> | undefined;
   const repoFullName = readString(repository?.full_name);
   const pr = payload.pull_request as Record<string, unknown> | undefined;
@@ -198,7 +216,10 @@ async function handlePushEvent(
   ctx: PluginContext,
   config: GitHubConfig,
   payload: Record<string, unknown>,
+  deliveryId: string,
 ): Promise<void> {
+  if (await isDuplicateDelivery(ctx, deliveryId)) return;
+
   const repository = payload.repository as Record<string, unknown> | undefined;
   const repoFullName = readString(repository?.full_name);
   const ref = readString(payload.ref);
@@ -239,11 +260,15 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
 
     const token = await ctx.secrets.resolve(config.githubTokenRef);
 
-    await markOutboundEcho(ctx, issueId);
     const ghIssue = await createGitHubIssue(ctx, token, config.owner, config.repo, {
       title: issue.title,
       body: issue.description ?? undefined,
     });
+
+    // Mark echo AFTER a successful API call so that a failed call does not
+    // silently block retries (BUG 3 fix). The key is owner/repo/ghNumber so
+    // the inbound handler can match it by the real GitHub issue number (BUG 1 fix).
+    await markOutboundIssueEcho(ctx, config.owner, config.repo, ghIssue.number);
 
     // Store reverse mapping so updates can find the GH issue number
     await setIssueMapping(ctx, config.owner, config.repo, ghIssue.number, issueId);
@@ -273,7 +298,6 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     };
     if (issue.status === "done") patch.state = "closed";
 
-    await markOutboundEcho(ctx, issueId);
     // We don't know the GH number here without a reverse index; log and skip.
     ctx.logger.info("issue.updated outbound: reverse GH number lookup not yet implemented — skipping sync", { issueId });
     void token; void patch; // suppress unused-variable warnings until reverse index is implemented
@@ -369,10 +393,10 @@ const plugin: PaperclipPlugin = definePlugin({
         await handlePullRequestEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.pullRequestReview:
-        await handlePullRequestReviewEvent(ctx, config, payload);
+        await handlePullRequestReviewEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.push:
-        await handlePushEvent(ctx, config, payload);
+        await handlePushEvent(ctx, config, payload, deliveryId);
         break;
       default:
         ctx.logger.info(`GitHub connector: ignoring unhandled event "${event}"`);

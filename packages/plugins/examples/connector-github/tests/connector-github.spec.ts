@@ -257,6 +257,55 @@ describe("mapping helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
+// markOutboundIssueEcho / consumeOutboundIssueEcho (BUG 1 fix)
+// ---------------------------------------------------------------------------
+
+describe("outbound issue echo helpers", () => {
+  it("consumeOutboundIssueEcho returns false when no marker exists", async () => {
+    const { consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const ctx = makeMockCtx();
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 1)).toBe(false);
+  });
+
+  it("markOutboundIssueEcho then consumeOutboundIssueEcho returns true", async () => {
+    const { markOutboundIssueEcho, consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const ctx = makeMockCtx();
+    await markOutboundIssueEcho(ctx, "acme", "repo", 42);
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 42)).toBe(true);
+  });
+
+  it("consume is single-use: second call returns false", async () => {
+    const { markOutboundIssueEcho, consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const ctx = makeMockCtx();
+    await markOutboundIssueEcho(ctx, "acme", "repo", 7);
+    await consumeOutboundIssueEcho(ctx, "acme", "repo", 7); // first consume
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 7)).toBe(false); // second is false
+  });
+
+  it("returns false for expired marker (ts > 30s ago)", async () => {
+    const { consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const staleTs = Date.now() - 31_000;
+    // Manually seed stale state matching the outbound-echo key format
+    const ctx = makeMockCtx({ "github:outbound-echo:acme/repo:5": { ts: staleTs } });
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 5)).toBe(false);
+  });
+
+  it("returns false for corrupted ts", async () => {
+    const { consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const ctx = makeMockCtx({ "github:outbound-echo:acme/repo:3": { ts: "not-a-number" } });
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 3)).toBe(false);
+  });
+
+  it("different gh numbers have distinct markers", async () => {
+    const { markOutboundIssueEcho, consumeOutboundIssueEcho } = await import("../src/mapping.js");
+    const ctx = makeMockCtx();
+    await markOutboundIssueEcho(ctx, "acme", "repo", 10);
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 11)).toBe(false);
+    expect(await consumeOutboundIssueEcho(ctx, "acme", "repo", 10)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Manifest assertions (security contract)
 // ---------------------------------------------------------------------------
 
