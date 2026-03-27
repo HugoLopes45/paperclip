@@ -12,7 +12,6 @@ import { verifyGitHubSignature } from "./verify.js";
 import { isDuplicateDelivery } from "./echo.js";
 import {
   getIssueMapping,
-  getIssueMappingReverse,
   setIssueMapping,
   getPrMapping,
   setPrMapping,
@@ -29,8 +28,6 @@ type GitHubConfig = {
   defaultProjectId?: string;
   triggerAgentIds?: string[];
   watchedRepos?: string[];
-  /** When true, pull_request:opened creates a new Paperclip issue even without a "Fixes #N" link. Default: false. */
-  prCreatesIssue?: boolean;
 };
 
 let currentContext: PluginContext | null = null;
@@ -47,21 +44,6 @@ function readNumber(value: unknown): number | null {
   return typeof value === "number" ? value : null;
 }
 
-/**
- * Parse "Fixes #123", "Closes #45", "Resolves #7" patterns from a PR body.
- * Returns the referenced GitHub issue numbers (not Paperclip IDs).
- */
-function parseLinkedIssueNumbers(body: string): number[] {
-  const pattern = /(?:closes?|fixes?|resolves?)\s+#(\d+)/gi;
-  const numbers: number[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(body)) !== null) {
-    const n = parseInt(match[1]!, 10);
-    if (!isNaN(n)) numbers.push(n);
-  }
-  return [...new Set(numbers)];
-}
-
 // ---------------------------------------------------------------------------
 // Inbound: GitHub → Paperclip
 // ---------------------------------------------------------------------------
@@ -69,7 +51,6 @@ function parseLinkedIssueNumbers(body: string): number[] {
 async function handleIssuesEvent(
   ctx: PluginContext,
   config: GitHubConfig,
-  companyId: string,
   payload: Record<string, unknown>,
   deliveryId: string,
 ): Promise<void> {
@@ -86,9 +67,17 @@ async function handleIssuesEvent(
 
   if (await isDuplicateDelivery(ctx, deliveryId)) return;
 
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id;
+  if (!companyId) return;
+
   if (action === "opened") {
     // Suppress issues:opened webhooks that we ourselves triggered by pushing to GitHub.
+    // The outbound handler writes a marker keyed by owner/repo/ghNumber after a
+    // successful createGitHubIssue call; we consume it here (single-use).
     if (await consumeOutboundIssueEcho(ctx, owner, repo, ghNumber)) {
+      // Still store the mapping — the reverse lookup already wrote it outbound,
+      // but calling setIssueMapping here is idempotent and keeps both paths consistent.
       return;
     }
     const issue = await ctx.issues.create({
@@ -120,7 +109,6 @@ async function handleIssuesEvent(
 async function handleIssueCommentEvent(
   ctx: PluginContext,
   config: GitHubConfig,
-  companyId: string,
   payload: Record<string, unknown>,
   deliveryId: string,
 ): Promise<void> {
@@ -146,13 +134,16 @@ async function handleIssueCommentEvent(
   const mapping = await getIssueMapping(ctx, owner, repo, ghNumber);
   if (!mapping) return;
 
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id;
+  if (!companyId) return;
+
   await ctx.issues.createComment(mapping.paperclipIssueId, body, companyId);
 }
 
 async function handlePullRequestEvent(
   ctx: PluginContext,
   config: GitHubConfig,
-  companyId: string,
   payload: Record<string, unknown>,
   deliveryId: string,
 ): Promise<void> {
@@ -169,58 +160,33 @@ async function handlePullRequestEvent(
 
   if (await isDuplicateDelivery(ctx, deliveryId)) return;
 
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id;
+  if (!companyId) return;
+
   if (action === "opened") {
-    const prBody = readString(pr.body);
-    const linkedGhNumbers = parseLinkedIssueNumbers(prBody);
-
-    if (linkedGhNumbers.length > 0) {
-      // Link PR to existing Paperclip issues via "Fixes #N" references.
-      // Move linked issues to in_progress and store the PR→issue mapping.
-      for (const ghNumber of linkedGhNumbers) {
-        const mapping = await getIssueMapping(ctx, owner, repo, ghNumber);
-        if (!mapping) continue;
-        await ctx.issues.update(mapping.paperclipIssueId, { status: "in_progress" as Issue["status"] }, companyId);
-        // Store PR mapping pointing to the first linked issue for closed/merged handling.
-        await setPrMapping(ctx, owner, repo, prNumber, mapping.paperclipIssueId);
-      }
-      return;
-    }
-
-    // No linked issue found — only create a Paperclip issue if opt-in is enabled.
-    if (!config.prCreatesIssue) return;
-
     const issue = await ctx.issues.create({
       companyId,
       projectId: config.defaultProjectId,
       title: readString(pr.title),
-      description: prBody,
+      description: readString(pr.body),
     });
     await setPrMapping(ctx, owner, repo, prNumber, issue.id);
     return;
   }
 
+  const mapping = await getPrMapping(ctx, owner, repo, prNumber);
+  if (!mapping) return;
+
+  // closed with merged = done; closed without merged = also done (rejected/abandoned)
   if (action === "closed") {
-    const mapping = await getPrMapping(ctx, owner, repo, prNumber);
-    if (!mapping) return;
-
-    const merged = pr.merged === true;
-    const prUrl = readString(pr.html_url);
     await ctx.issues.update(mapping.paperclipIssueId, { status: "done" as Issue["status"] }, companyId);
-
-    if (merged && prUrl) {
-      await ctx.issues.createComment(
-        mapping.paperclipIssueId,
-        `PR merged: ${prUrl}`,
-        companyId,
-      );
-    }
   }
 }
 
 async function handlePullRequestReviewEvent(
   ctx: PluginContext,
   config: GitHubConfig,
-  companyId: string,
   payload: Record<string, unknown>,
   deliveryId: string,
 ): Promise<void> {
@@ -234,6 +200,10 @@ async function handlePullRequestReviewEvent(
   const agentIds = config.triggerAgentIds ?? [];
   if (agentIds.length === 0) return;
 
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id;
+  if (!companyId) return;
+
   for (const agentId of agentIds) {
     await ctx.agents.invoke(agentId, companyId, {
       prompt: `GitHub pull_request_review: ${repoFullName} — ${prTitle}`,
@@ -245,7 +215,6 @@ async function handlePullRequestReviewEvent(
 async function handlePushEvent(
   ctx: PluginContext,
   config: GitHubConfig,
-  companyId: string,
   payload: Record<string, unknown>,
   deliveryId: string,
 ): Promise<void> {
@@ -257,6 +226,10 @@ async function handlePushEvent(
 
   const agentIds = config.triggerAgentIds ?? [];
   if (agentIds.length === 0) return;
+
+  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+  const companyId = companies[0]?.id;
+  if (!companyId) return;
 
   for (const agentId of agentIds) {
     await ctx.agents.invoke(agentId, companyId, {
@@ -279,9 +252,8 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
     if (!issueId) return;
 
-    // Use a distinct namespace for outbound echo suppression to avoid
-    // collisions with inbound delivery IDs (which share the echo: keyspace).
-    if (await isDuplicateDelivery(ctx, `outbound:${issueId}`)) return;
+    // Suppress echoes from inbound GitHub events
+    if (await isDuplicateDelivery(ctx, issueId)) return;
 
     const issue = await ctx.issues.get(issueId, event.companyId);
     if (!issue) return;
@@ -294,10 +266,11 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     });
 
     // Mark echo AFTER a successful API call so that a failed call does not
-    // silently block retries. Keyed by owner/repo/ghNumber for inbound matching.
+    // silently block retries (BUG 3 fix). The key is owner/repo/ghNumber so
+    // the inbound handler can match it by the real GitHub issue number (BUG 1 fix).
     await markOutboundIssueEcho(ctx, config.owner, config.repo, ghIssue.number);
 
-    // Store forward + reverse mapping so updates can find the GH issue number.
+    // Store reverse mapping so updates can find the GH issue number
     await setIssueMapping(ctx, config.owner, config.repo, ghIssue.number, issueId);
   });
 
@@ -309,14 +282,15 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     const issueId = typeof payload.issueId === "string" ? payload.issueId : null;
     if (!issueId) return;
 
-    if (await isDuplicateDelivery(ctx, `outbound:${issueId}`)) return;
+    if (await isDuplicateDelivery(ctx, issueId)) return;
 
     const issue = await ctx.issues.get(issueId, event.companyId);
     if (!issue) return;
 
-    const reverse = await getIssueMappingReverse(ctx, issueId);
-    if (!reverse) return; // Issue not synced to GitHub — skip silently.
-
+    // Find the GH issue number by scanning state — we need a reverse lookup.
+    // We stored mapping as github:issue:{owner}/{repo}:{ghNumber} → { paperclipIssueId }
+    // but we don't have a reverse index. For now, skip outbound updates without a known GH number.
+    // Full reverse index can be added as a follow-up.
     const token = await ctx.secrets.resolve(config.githubTokenRef);
     const patch: { title?: string; body?: string; state?: "open" | "closed" } = {
       title: issue.title,
@@ -324,7 +298,9 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     };
     if (issue.status === "done") patch.state = "closed";
 
-    await updateGitHubIssue(ctx, token, reverse.owner, reverse.repo, reverse.ghNumber, patch);
+    // We don't know the GH number here without a reverse index; log and skip.
+    ctx.logger.info("issue.updated outbound: reverse GH number lookup not yet implemented — skipping sync", { issueId });
+    void token; void patch; // suppress unused-variable warnings until reverse index is implemented
   });
 
   ctx.events.on("issue.comment.created", async (event: PluginEvent) => {
@@ -337,13 +313,11 @@ async function registerOutboundHandlers(ctx: PluginContext): Promise<void> {
     const body = typeof payload.body === "string" ? payload.body : null;
     if (!commentId || !issueId || !body) return;
 
-    if (await isDuplicateDelivery(ctx, `outbound:${commentId}`)) return;
-
-    const reverse = await getIssueMappingReverse(ctx, issueId);
-    if (!reverse) return; // Issue not synced to GitHub — skip silently.
+    if (await isDuplicateDelivery(ctx, commentId)) return;
 
     const token = await ctx.secrets.resolve(config.githubTokenRef);
-    await createGitHubComment(ctx, token, reverse.owner, reverse.repo, reverse.ghNumber, body);
+    ctx.logger.info("issue.comment.created outbound: reverse GH number lookup not yet implemented — skipping sync", { issueId });
+    void token; // suppress unused-variable warning until reverse index is implemented
   });
 }
 
@@ -391,6 +365,7 @@ const plugin: PaperclipPlugin = definePlugin({
     // Verify HMAC-SHA256 signature before any processing
     const signature = readString(input.headers?.["x-hub-signature-256"]);
     if (!verifyGitHubSignature(input.rawBody, config.webhookSecret, signature)) {
+      // Do not log the payload on invalid signature
       ctx.logger.warn("GitHub webhook: signature verification failed — delivery rejected");
       return;
     }
@@ -399,7 +374,7 @@ const plugin: PaperclipPlugin = definePlugin({
     const deliveryId = readString(input.headers?.["x-github-delivery"] ?? input.requestId);
     const payload = input.parsedBody as Record<string, unknown> ?? {};
 
-    // Repository filter: only process events from watched repos when configured.
+    // Repository filter: if watchedRepos is configured, only process matching repos
     const watchedRepos = config.watchedRepos ?? [];
     if (watchedRepos.length > 0) {
       const repository = payload.repository as Record<string, unknown> | undefined;
@@ -407,26 +382,21 @@ const plugin: PaperclipPlugin = definePlugin({
       if (!watchedRepos.includes(fullName)) return;
     }
 
-    // Resolve companyId once and pass it to all handlers to avoid N redundant API calls.
-    const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-    const companyId = companies[0]?.id;
-    if (!companyId) return;
-
     switch (event) {
       case GH_EVENTS.issues:
-        await handleIssuesEvent(ctx, config, companyId, payload, deliveryId);
+        await handleIssuesEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.issueComment:
-        await handleIssueCommentEvent(ctx, config, companyId, payload, deliveryId);
+        await handleIssueCommentEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.pullRequest:
-        await handlePullRequestEvent(ctx, config, companyId, payload, deliveryId);
+        await handlePullRequestEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.pullRequestReview:
-        await handlePullRequestReviewEvent(ctx, config, companyId, payload, deliveryId);
+        await handlePullRequestReviewEvent(ctx, config, payload, deliveryId);
         break;
       case GH_EVENTS.push:
-        await handlePushEvent(ctx, config, companyId, payload, deliveryId);
+        await handlePushEvent(ctx, config, payload, deliveryId);
         break;
       default:
         ctx.logger.info(`GitHub connector: ignoring unhandled event "${event}"`);

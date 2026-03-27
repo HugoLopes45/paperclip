@@ -241,12 +241,9 @@ describe("mapping helpers", () => {
     await setIssueMapping(ctx, "org", "myrepo", 1, "issue-id");
     await setPrMapping(ctx, "org", "myrepo", 1, "pr-id");
     const calls = (ctx.state.set as ReturnType<typeof vi.fn>).mock.calls as [{ stateKey: string }, unknown][];
-    // setIssueMapping now writes 2 entries (forward + reverse); setPrMapping writes 1.
-    const allKeys = calls.map((c) => c[0].stateKey);
-    expect(allKeys.some((k) => k.includes("issue"))).toBe(true);
-    expect(allKeys.some((k) => k.includes("pr"))).toBe(true);
-    // All keys must be distinct
-    expect(new Set(allKeys).size).toBe(allKeys.length);
+    expect(calls[0][0].stateKey).not.toEqual(calls[1][0].stateKey);
+    expect(calls[0][0].stateKey).toContain("issue");
+    expect(calls[1][0].stateKey).toContain("pr");
   });
 
   it("different GH numbers produce different state keys", async () => {

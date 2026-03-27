@@ -70,12 +70,6 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         default: [],
       },
-      prCreatesIssue: {
-        type: "boolean",
-        title: "Create issue for unlinked PRs",
-        description: "When true, opening a PR without a 'Fixes #N' link creates a new Paperclip issue. Default: false.",
-        default: false,
-      },
     },
   },
   webhooks: [
