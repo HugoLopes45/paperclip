@@ -514,7 +514,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: proc.signal,
         timedOut: false,
         errorMessage: parseFallbackErrorMessage(proc),
-        errorCode: loginMeta.requiresLogin ? "claude_auth_required" : rateLimitMeta.rateLimited ? "rate_limit_exhausted" : null,
+        errorCode: loginMeta.requiresLogin ? "claude_auth_required" : (proc.exitCode ?? 0) !== 0 && rateLimitMeta.rateLimited ? "rate_limit_exhausted" : null,
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
@@ -557,7 +557,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (proc.exitCode ?? 0) === 0
           ? null
           : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`,
-      errorCode: loginMeta.requiresLogin ? "claude_auth_required" : rateLimitMeta.rateLimited ? "rate_limit_exhausted" : null,
+      errorCode: loginMeta.requiresLogin ? "claude_auth_required" : (proc.exitCode ?? 0) !== 0 && rateLimitMeta.rateLimited ? "rate_limit_exhausted" : null,
       errorMeta,
       usage,
       sessionId: resolvedSessionId,

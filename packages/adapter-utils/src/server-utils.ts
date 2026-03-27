@@ -62,6 +62,7 @@ export function rateLimitBackoffMs(attempt: number, baseDelayMs = RATE_LIMIT_RET
   const jitter = Math.floor(Math.random() * baseDelayMs * 0.5);
   return exponential + jitter;
 }
+
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",

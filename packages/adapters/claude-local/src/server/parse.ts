@@ -173,8 +173,7 @@ export function detectClaudeRateLimit(input: {
   stdout: string;
   stderr: string;
 }): { rateLimited: boolean } {
-  const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
+  const messages = [...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
