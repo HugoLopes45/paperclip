@@ -151,6 +151,8 @@ export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
+  /** Agent-level default from runtimeConfig.workspaceStrategy — used when no project/issue policy is set. */
+  agentWorkspaceStrategy?: "git_worktree" | "project_primary" | null;
 }): ParsedExecutionWorkspaceMode {
   const issueMode = input.issueSettings?.mode;
   if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
@@ -165,6 +167,10 @@ export function resolveExecutionWorkspaceMode(input: {
   if (input.legacyUseProjectWorkspace === false) {
     return "agent_default";
   }
+  // Agent-level fallback: runtimeConfig.workspaceStrategy overrides the default shared_workspace
+  // when no project or issue policy is in effect.
+  if (input.agentWorkspaceStrategy === "git_worktree") return "isolated_workspace";
+  if (input.agentWorkspaceStrategy === "project_primary") return "shared_workspace";
   return "shared_workspace";
 }
 

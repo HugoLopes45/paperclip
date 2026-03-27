@@ -2056,10 +2056,17 @@ export function heartbeatService(db: Db) {
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
     const config = parseObject(agent.adapterConfig);
+    const agentRuntimeConfig = parseObject(agent.runtimeConfig);
+    const agentWorkspaceStrategy = (() => {
+      const v = agentRuntimeConfig.workspaceStrategy;
+      if (v === "git_worktree" || v === "project_primary") return v;
+      return null;
+    })();
     const executionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      agentWorkspaceStrategy,
     });
     const resolvedWorkspace = await resolveWorkspaceForRun(
       agent,

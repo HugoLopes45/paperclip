@@ -2,11 +2,16 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { STATE_NS } from "./constants.js";
 
 type IssueMapping = { paperclipIssueId: string };
+type IssueMappingReverse = { owner: string; repo: string; ghNumber: number };
 type PrMapping = { paperclipIssueId: string };
 type OutboundEchoRecord = { ts: number };
 
 function issueKey(owner: string, repo: string, ghNumber: number): string {
   return `${STATE_NS}:issue:${owner}/${repo}:${ghNumber}`;
+}
+
+function issueReverseKey(paperclipIssueId: string): string {
+  return `${STATE_NS}:issue-reverse:${paperclipIssueId}`;
 }
 
 function prKey(owner: string, repo: string, prNumber: number): string {
@@ -40,6 +45,29 @@ export async function setIssueMapping(
     { scopeKind: "instance", stateKey: issueKey(owner, repo, ghNumber) },
     { paperclipIssueId },
   );
+  // Reverse index: paperclipIssueId → { owner, repo, ghNumber }
+  // Required for outbound issue.updated and issue.comment.created handlers.
+  await ctx.state.set(
+    { scopeKind: "instance", stateKey: issueReverseKey(paperclipIssueId) },
+    { owner, repo, ghNumber } satisfies IssueMappingReverse,
+  );
+}
+
+export async function getIssueMappingReverse(
+  ctx: PluginContext,
+  paperclipIssueId: string,
+): Promise<IssueMappingReverse | null> {
+  const raw = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: issueReverseKey(paperclipIssueId),
+  }) as IssueMappingReverse | null;
+  if (
+    !raw ||
+    typeof raw.owner !== "string" ||
+    typeof raw.repo !== "string" ||
+    typeof raw.ghNumber !== "number"
+  ) return null;
+  return raw;
 }
 
 export async function getPrMapping(
