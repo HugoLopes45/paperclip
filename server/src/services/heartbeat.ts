@@ -98,6 +98,13 @@ const RATE_LIMIT_FALLBACK_MODEL_OVERRIDES: Record<string, string> = {
 };
 const RATE_LIMIT_FALLBACK_SOURCE_ADAPTERS = new Set(["claude_local"]);
 
+// Thundering herd mitigation
+// Max simultaneous claude_local runs across the entire company (token bucket backpressure)
+const ADAPTER_GLOBAL_MAX_CONCURRENT = 3;
+// Stagger window: first tick offset = hash(agentId) % (intervalSec / 2) seconds
+// This ensures agents don't all wake at the same scheduler tick
+const STAGGER_DIVISOR = 2;
+
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
   workspaceConfig: ExecutionWorkspaceConfig | null;
@@ -977,6 +984,32 @@ export function heartbeatService(db: Db) {
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Deterministic stagger offset for an agent based on its ID.
+   * Spreads first-tick wakeups across [0, intervalSec/STAGGER_DIVISOR] seconds.
+   */
+  function staggerOffsetMs(agentId: string, intervalSec: number): number {
+    let hash = 0;
+    for (let i = 0; i < agentId.length; i++) {
+      hash = (hash * 31 + agentId.charCodeAt(i)) >>> 0;
+    }
+    const windowMs = (intervalSec / STAGGER_DIVISOR) * 1000;
+    return hash % windowMs;
+  }
+
+  /**
+   * Count running heartbeat runs for a specific adapter type across all agents.
+   * Used for global backpressure (token bucket) to prevent thundering herd.
+   */
+  async function countRunningRunsByAdapterType(adapterType: string): Promise<number> {
+    const result = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(eq(heartbeatRuns.status, "running"), eq(agents.adapterType, adapterType)));
+    return result[0]?.count ?? 0;
   }
 
   async function getRun(runId: string) {
@@ -4430,6 +4463,11 @@ export function heartbeatService(db: Db) {
       let checked = 0;
       let enqueued = 0;
       let skipped = 0;
+      let throttled = 0;
+
+      // Backpressure: track global running count per adapter type so we don't
+      // launch a new wave if the previous one hasn't finished yet.
+      const adapterRunningCount = new Map<string, number>();
 
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
@@ -4437,9 +4475,32 @@ export function heartbeatService(db: Db) {
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 
         checked += 1;
-        const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+
+        // Stagger: new agents (no lastHeartbeatAt) get a deterministic offset so
+        // they don't all fire on the very first scheduler tick.
+        const isFirstHeartbeat = !agent.lastHeartbeatAt;
+        const baseline = isFirstHeartbeat
+          ? new Date(agent.createdAt).getTime() + staggerOffsetMs(agent.id, policy.intervalSec)
+          : new Date(agent.lastHeartbeatAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        // Backpressure: lazy-load the global running count for this adapter type.
+        if (!adapterRunningCount.has(agent.adapterType)) {
+          const count = await countRunningRunsByAdapterType(agent.adapterType);
+          adapterRunningCount.set(agent.adapterType, count);
+        }
+        const globalRunning = adapterRunningCount.get(agent.adapterType) ?? 0;
+        if (globalRunning >= ADAPTER_GLOBAL_MAX_CONCURRENT) {
+          // Too many agents running on this adapter — defer until next tick.
+          logger.debug(
+            { agentId: agent.id, adapterType: agent.adapterType, globalRunning },
+            "tickTimers: global adapter concurrency cap reached, deferring agent",
+          );
+          throttled += 1;
+          skipped += 1;
+          continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -4453,11 +4514,16 @@ export function heartbeatService(db: Db) {
             now: now.toISOString(),
           },
         });
-        if (run) enqueued += 1;
-        else skipped += 1;
+        if (run) {
+          enqueued += 1;
+          // Optimistically increment so subsequent agents in the same tick see the cap.
+          adapterRunningCount.set(agent.adapterType, globalRunning + 1);
+        } else {
+          skipped += 1;
+        }
       }
 
-      return { checked, enqueued, skipped };
+      return { checked, enqueued, skipped, throttled };
     },
 
     tickRateLimitRestore: async (now = new Date()) => {
