@@ -180,6 +180,7 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
   issueSettings: IssueExecutionWorkspaceSettings | null;
   mode: ParsedExecutionWorkspaceMode;
   legacyUseProjectWorkspace: boolean | null;
+  agentWorkspaceStrategy?: string | null;
 }): Record<string, unknown> {
   const nextConfig = { ...input.agentConfig };
   const projectHasPolicy = Boolean(input.projectPolicy?.enabled);
@@ -188,7 +189,12 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
     input.issueSettings?.workspaceStrategy ||
     input.issueSettings?.workspaceRuntime,
   );
-  const hasWorkspaceControl = projectHasPolicy || issueHasWorkspaceOverrides || input.legacyUseProjectWorkspace === false;
+  const hasWorkspaceControl =
+    projectHasPolicy ||
+    issueHasWorkspaceOverrides ||
+    input.legacyUseProjectWorkspace === false ||
+    input.agentWorkspaceStrategy === "git_worktree" ||
+    input.agentWorkspaceStrategy === "project_primary";
 
   if (hasWorkspaceControl) {
     if (input.mode === "isolated_workspace") {
