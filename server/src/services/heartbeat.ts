@@ -99,10 +99,14 @@ const RATE_LIMIT_FALLBACK_MODEL_OVERRIDES: Record<string, string> = {
 const RATE_LIMIT_FALLBACK_SOURCE_ADAPTERS = new Set(["claude_local"]);
 
 // Thundering herd mitigation
-// Max simultaneous claude_local runs across the entire company (token bucket backpressure)
-const ADAPTER_GLOBAL_MAX_CONCURRENT = 3;
-// Stagger window: first tick offset = hash(agentId) % (intervalSec / 2) seconds
-// This ensures agents don't all wake at the same scheduler tick
+// Max simultaneous runs per adapter type across the entire company (token bucket backpressure).
+// Reads from env PAPERCLIP_ADAPTER_MAX_CONCURRENT if set; falls back to 3.
+const ADAPTER_GLOBAL_MAX_CONCURRENT = (() => {
+  const v = parseInt(process.env.PAPERCLIP_ADAPTER_MAX_CONCURRENT ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 3;
+})();
+// Stagger: spread wakeups across a window of intervalSec/STAGGER_DIVISOR seconds.
+// Applied to EVERY agent (not just new ones) so long-running groups don't re-synchronise.
 const STAGGER_DIVISOR = 2;
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
@@ -2469,6 +2473,17 @@ export function heartbeatService(db: Db) {
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
+      // Global backpressure: honour the adapter-level concurrency cap so that
+      // assignment/on-demand wakeups don't bypass the thundering herd guard.
+      const globalRunning = await countRunningRunsByAdapterType(agent.adapterType);
+      if (globalRunning >= ADAPTER_GLOBAL_MAX_CONCURRENT) {
+        logger.debug(
+          { agentId, adapterType: agent.adapterType, globalRunning, cap: ADAPTER_GLOBAL_MAX_CONCURRENT },
+          "startNextQueuedRunForAgent: global adapter concurrency cap reached, deferring queued run",
+        );
+        return [];
+      }
+
       const queuedRuns = await db
         .select()
         .from(heartbeatRuns)
@@ -4476,14 +4491,12 @@ export function heartbeatService(db: Db) {
 
         checked += 1;
 
-        // Stagger: new agents (no lastHeartbeatAt) get a deterministic offset so
-        // they don't all fire on the very first scheduler tick.
-        const isFirstHeartbeat = !agent.lastHeartbeatAt;
-        const baseline = isFirstHeartbeat
-          ? new Date(agent.createdAt).getTime() + staggerOffsetMs(agent.id, policy.intervalSec)
-          : new Date(agent.lastHeartbeatAt).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
+        // Stagger: apply a deterministic per-agent offset to the expected wakeup time.
+        // Using lastHeartbeatAt as baseline ensures the offset is re-applied after every
+        // run, so agents that synchronised in the past gradually drift apart again.
+        const baselineMs = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
+        const expectedMs = baselineMs + policy.intervalSec * 1000 + staggerOffsetMs(agent.id, policy.intervalSec);
+        if (now.getTime() < expectedMs) continue;
 
         // Backpressure: lazy-load the global running count for this adapter type.
         if (!adapterRunningCount.has(agent.adapterType)) {
@@ -4492,10 +4505,17 @@ export function heartbeatService(db: Db) {
         }
         const globalRunning = adapterRunningCount.get(agent.adapterType) ?? 0;
         if (globalRunning >= ADAPTER_GLOBAL_MAX_CONCURRENT) {
-          // Too many agents running on this adapter — defer until next tick.
+          // Cap reached: bump lastHeartbeatAt by one tick so this agent re-staggers
+          // relative to its own offset instead of piling up with every other deferred
+          // agent at the very next scheduler run.
+          const nextWindowMs = policy.intervalSec * 1000;
+          await db
+            .update(agents)
+            .set({ lastHeartbeatAt: new Date(now.getTime() - nextWindowMs + staggerOffsetMs(agent.id, policy.intervalSec)) })
+            .where(eq(agents.id, agent.id));
           logger.debug(
-            { agentId: agent.id, adapterType: agent.adapterType, globalRunning },
-            "tickTimers: global adapter concurrency cap reached, deferring agent",
+            { agentId: agent.id, adapterType: agent.adapterType, globalRunning, cap: ADAPTER_GLOBAL_MAX_CONCURRENT },
+            "tickTimers: global adapter concurrency cap reached, re-staggering agent",
           );
           throttled += 1;
           skipped += 1;
